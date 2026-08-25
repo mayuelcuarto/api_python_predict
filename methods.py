@@ -1,0 +1,444 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from math import exp, factorial
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+
+
+class _Poisson:
+    @staticmethod
+    def pmf(value: int, mean: float) -> float:
+        if mean == 0:
+            return 1.0 if value == 0 else 0.0
+        return exp(-mean) * mean ** value / factorial(value)
+
+    @classmethod
+    def cdf(cls, value: int, mean: float) -> float:
+        if value < 0:
+            return 0.0
+        return sum(cls.pmf(index, mean) for index in range(value + 1))
+
+
+poisson = _Poisson()
+
+app = FastAPI(title="Soccer Scraper API")
+
+# Modelos de datos para la predicción
+class HistoricoPartido(BaseModel):
+    fecha: Optional[datetime] = None
+    goles: float
+    goles_recibidos: float
+    remates: float
+    remates_recibidos: float
+    remates_al_arco: float
+    remates_al_arco_recibidos: float
+    corners: float
+    corners_recibidos: float
+    posesion: float
+    faltas: float
+    faltas_recibidas: float
+    tarjetas_amarillas: float
+    tarjetas_amarillas_contrarias: float
+    tarjetas_rojas: float
+    tarjetas_rojas_contrarias: float
+    es_local: bool  # Indica si el equipo jugó en casa en ese partido histórico
+    sede_neutral: bool
+
+class DatosPrediccion(BaseModel):
+    equipo_local: List[HistoricoPartido]
+    equipo_visitante: List[HistoricoPartido]
+    es_neutral: bool = False
+    probabilidad: float = 0.75
+
+# Configuración de CORS para permitir peticiones desde Angular (habitualmente puerto 4200)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, usa ["http://localhost:4200"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/api/predict")
+def predict_match(data: DatosPrediccion):
+    SAFE_OVER_TARGET = data.probabilidad
+    SAFE_UNDER_TARGET = data.probabilidad
+
+    """
+    Realiza una predicción heurística basada en los últimos partidos,
+    diferenciando el rendimiento según la fortaleza de local y visita.
+    """
+    def get_averages(history: List[HistoricoPartido], condicion_actual_local: bool = None):
+        if not history:
+            return {k: 0.0 for k in [
+                "goles_f", "goles_c", "remates_f", "remates_c", "remates_arco_f", "remates_arco_c", 
+                "corners_f", "corners_c", "faltas_f", "faltas_c", 
+                "amarillas_f", "amarillas_c", "rojas_f", "rojas_c",
+                "simple_remates", "simple_remates_arco", "simple_corners", "simple_faltas", "simple_amarillas"
+            ]}
+
+        # 1. Ordenar por fecha (más reciente primero)
+        history_sorted = history
+        if all(h.fecha is not None for h in history):
+            history_sorted = sorted(history, key=lambda x: x.fecha, reverse=True)
+
+        # 2. Tomar muestra de los últimos 10 partidos
+        sample = history_sorted[:10]
+        n = len(sample)
+
+        # 3. Definir pesos combinados: Recencia + Condición (Local/Visita/Neutral)
+        weights = []
+        for i, h in enumerate(sample):
+            # Peso por recencia (más nuevo = más peso, de n a 1)
+            w_time = (n - i) if all(s.fecha is not None for s in sample) else 1
+            
+            # Peso por condición: si coincide con la situación actual, damos más relevancia
+            w_cond = 1.0
+            if condicion_actual_local is None:
+                # Si el partido actual es neutral, priorizamos históricos que también fueron en sede neutral
+                w_cond = 2.0 if h.sede_neutral else 1.0
+            else:
+                # Priorizamos históricos que coinciden con la condición actual (Local/Visita) y no fueron neutrales
+                if not h.sede_neutral and h.es_local == condicion_actual_local:
+                    w_cond = 2.0
+            
+            weights.append(float(w_time * w_cond))
+
+        # Función interna para calcular la media ponderada de una métrica, ignorando valores de -1
+        def weighted_avg(data_list: List[float]) -> float:
+            filtered_data = []
+            filtered_weights = []
+            for val, w in zip(data_list, weights):
+                if val != -1:
+                    filtered_data.append(val)
+                    filtered_weights.append(w)
+            
+            if not filtered_data:
+                return 0.0
+            return float(sum(value * weight for value, weight in zip(filtered_data, filtered_weights)) / sum(filtered_weights))
+
+        stats = {
+            "goles_f": weighted_avg([h.goles for h in sample]),
+            "goles_c": weighted_avg([h.goles_recibidos for h in sample]),
+            "remates_f": weighted_avg([h.remates for h in sample]),
+            "remates_c": weighted_avg([h.remates_recibidos for h in sample]),
+            "remates_arco_f": weighted_avg([h.remates_al_arco for h in sample]),
+            "remates_arco_c": weighted_avg([h.remates_al_arco_recibidos for h in sample]),
+            "corners_f": weighted_avg([h.corners for h in sample]),
+            "corners_c": weighted_avg([h.corners_recibidos for h in sample]),
+            "faltas_f": weighted_avg([h.faltas for h in sample]),
+            "faltas_c": weighted_avg([h.faltas_recibidas for h in sample]),
+            "amarillas_f": weighted_avg([h.tarjetas_amarillas for h in sample]),
+            "amarillas_c": weighted_avg([h.tarjetas_amarillas_contrarias for h in sample]),
+            "rojas_f": weighted_avg([h.tarjetas_rojas for h in sample]),
+            "rojas_c": weighted_avg([h.tarjetas_rojas_contrarias for h in sample]),
+        }
+
+        # Media simple filtrada por condición (Local/Visita) sin pesos para el reporte detallado, ignorando -1
+        def simple_cond_avg(attr_name: str) -> float:
+            if condicion_actual_local is None:
+                # Si es neutral, tomamos la media simple de la muestra reciente filtrando -1
+                relevant_data = [getattr(h, attr_name) for h in sample if getattr(h, attr_name) != -1]
+            else:
+                # Filtramos el historial completo por la condición actual (Local o Visita) filtrando -1
+                relevant_data = [getattr(h, attr_name) for h in history_sorted 
+                                if h.es_local == condicion_actual_local and not h.sede_neutral and getattr(h, attr_name) != -1]
+            
+            if not relevant_data:
+                relevant_data = [getattr(h, attr_name) for h in sample if getattr(h, attr_name) != -1]
+                
+            return float(sum(relevant_data) / len(relevant_data)) if relevant_data else 0.0
+
+        stats.update({
+            "simple_remates": simple_cond_avg("remates"),
+            "simple_remates_arco": simple_cond_avg("remates_al_arco"),
+            "simple_corners": simple_cond_avg("corners"),
+            "simple_faltas": simple_cond_avg("faltas"),
+            "simple_amarillas": simple_cond_avg("tarjetas_amarillas"),
+        })
+        return stats
+
+    # Si es neutral, no filtramos por condición de local/visita para los pesos
+    condicion_l = None if data.es_neutral else True
+    condicion_v = None if data.es_neutral else False
+
+    # Calculamos promedios: si es neutral, se toma el rendimiento general reciente
+    avg_l = get_averages(data.equipo_local, condicion_actual_local=condicion_l)
+    avg_v = get_averages(data.equipo_visitante, condicion_actual_local=condicion_v)
+
+    # Heurística: xG (Goles Esperados) simplificado
+    # El xG de un equipo es el promedio entre lo que anota y lo que el rival recibe
+    mu_local = (avg_l["goles_f"] + avg_v["goles_c"]) / 2
+    mu_visitante = (avg_v["goles_f"] + avg_l["goles_c"]) / 2
+
+    # Probabilidades de anotar al menos un gol
+    prob_anotar_l = 1 - poisson.pmf(0, mu_local)
+    prob_anotar_v = 1 - poisson.pmf(0, mu_visitante)
+
+    # Predicciones detalladas por equipo (producción propia + concesión rival) / 2
+    rem_l = (avg_l["remates_f"] + avg_v["remates_c"]) / 2
+    rem_v = (avg_v["remates_f"] + avg_l["remates_c"]) / 2
+    arco_l = (avg_l["remates_arco_f"] + avg_v["remates_arco_c"]) / 2
+    arco_v = (avg_v["remates_arco_f"] + avg_l["remates_arco_c"]) / 2
+    corn_l = (avg_l["corners_f"] + avg_v["corners_c"]) / 2
+    corn_v = (avg_v["corners_f"] + avg_l["corners_c"]) / 2
+    faltas_l = (avg_l["faltas_f"] + avg_v["faltas_c"]) / 2
+    faltas_v = (avg_v["faltas_f"] + avg_l["faltas_c"]) / 2
+    amarillas_l = (avg_l["amarillas_f"] + avg_v["amarillas_c"]) / 2
+    amarillas_v = (avg_v["amarillas_f"] + avg_l["amarillas_c"]) / 2
+    rojas_l = (avg_l["rojas_f"] + avg_v["rojas_c"]) / 2
+    rojas_v = (avg_v["rojas_f"] + avg_l["rojas_c"]) / 2
+
+    mu_total_goles = mu_local + mu_visitante
+    mu_total_remates = rem_l + rem_v
+    mu_total_arco = arco_l + arco_v
+    mu_total_corners = corn_l + corn_v
+    mu_total_faltas = faltas_l + faltas_v
+    mu_total_amarillas = amarillas_l + amarillas_v
+
+    # Distribución de Poisson para probabilidades de resultado (0 a 5 goles)
+    max_goles = 6
+    local_probs = [poisson.pmf(goals, mu_local) for goals in range(max_goles)]
+    visitor_probs = [poisson.pmf(goals, mu_visitante) for goals in range(max_goles)]
+    probabilities = {
+        (local_goals, visitor_goals): local_probs[local_goals] * visitor_probs[visitor_goals]
+        for local_goals in range(max_goles)
+        for visitor_goals in range(max_goles)
+    }
+    prob_local = sum(probability for (local_goals, visitor_goals), probability in probabilities.items() if local_goals > visitor_goals)
+    prob_empate = sum(probability for (local_goals, visitor_goals), probability in probabilities.items() if local_goals == visitor_goals)
+    prob_visitante = sum(probability for (local_goals, visitor_goals), probability in probabilities.items() if local_goals < visitor_goals)
+    res_idx = max(probabilities, key=probabilities.get)
+
+    # Probabilidades de goles adicionales
+    prob_mas_1_5 = 1 - poisson.cdf(1, mu_total_goles)
+    prob_mas_2_5 = 1 - poisson.cdf(2, mu_total_goles)
+    prob_menos_3_5 = poisson.cdf(3, mu_total_goles)
+    prob_menos_4_5 = poisson.cdf(4, mu_total_goles)
+    prob_ambos_marcan = (1 - poisson.pmf(0, mu_local)) * (1 - poisson.pmf(0, mu_visitante))
+
+    # Probabilidad de que se cumplan los totales estimados (probabilidad de Over "media - 0.5")
+    # Por ejemplo, si la media es 9.2, calculamos P(X >= 9)
+    prob_remates_over = 1 - poisson.cdf(int(mu_total_remates) - 1, mu_total_remates)
+    prob_arco_over = 1 - poisson.cdf(int(mu_total_arco) - 1, mu_total_arco)
+    prob_corners_over = 1 - poisson.cdf(int(mu_total_corners) - 1, mu_total_corners)
+    prob_faltas_over = 1 - poisson.cdf(int(mu_total_faltas) - 1, mu_total_faltas)
+    prob_amarillas_over = 1 - poisson.cdf(max(0, int(mu_total_amarillas) - 1), mu_total_amarillas)
+
+    # Probabilidades de "menos" para totales y equipo
+    prob_menos_remates_totales = poisson.cdf(max(0, int(mu_total_remates)), mu_total_remates)
+    prob_menos_arco_totales = poisson.cdf(max(0, int(mu_total_arco)), mu_total_arco)
+    prob_menos_corners_totales = poisson.cdf(max(0, int(mu_total_corners)), mu_total_corners)
+    prob_menos_faltas_totales = poisson.cdf(max(0, int(mu_total_faltas)), mu_total_faltas)
+
+    prob_menos_remates_local = poisson.cdf(max(0, int(rem_l)), rem_l)
+    prob_menos_remates_visitante = poisson.cdf(max(0, int(rem_v)), rem_v)
+    prob_menos_arco_local = poisson.cdf(max(0, int(arco_l)), arco_l)
+    prob_menos_arco_visitante = poisson.cdf(max(0, int(arco_v)), arco_v)
+    prob_menos_corners_local = poisson.cdf(max(0, int(corn_l)), corn_l)
+    prob_menos_corners_visitante = poisson.cdf(max(0, int(corn_v)), corn_v)
+    prob_menos_faltas_local = poisson.cdf(max(0, int(faltas_l)), faltas_l)
+    prob_menos_faltas_visitante = poisson.cdf(max(0, int(faltas_v)), faltas_v)
+
+    # Cálculo de "Líneas Seguras" (objetivo ~75% de probabilidad)
+    def poisson_safe_over_threshold(mu_value: float, target: float = 0.75):
+        mu_value = max(mu_value, 0.0)
+        max_k = max(10, int(mu_value * 3) + 10)
+        best_k = 1
+        best_prob = 1 - poisson.cdf(0, mu_value)
+        for k in range(1, max_k):
+            prob = 1 - poisson.cdf(k - 1, mu_value)
+            if prob >= target:
+                best_k = k
+                best_prob = prob
+            else:
+                break
+        return best_k, best_prob
+
+    def poisson_safe_under_threshold(mu_value: float, target: float = 0.75):
+        mu_value = max(mu_value, 0.0)
+        max_k = max(10, int(mu_value * 3) + 10)
+        for k in range(0, max_k):
+            prob = poisson.cdf(k, mu_value)
+            if prob >= target:
+                return k, prob
+        return max(max_k - 1, 0), poisson.cdf(max(max_k - 1, 0), mu_value)
+
+    remates_totales_over_line, prob_remates_safe = poisson_safe_over_threshold(mu_total_remates, target=SAFE_OVER_TARGET)
+    remates_totales_under_line, prob_menos_remates_safe = poisson_safe_under_threshold(mu_total_remates, target=SAFE_UNDER_TARGET)
+    arco_totales_over_line, prob_arco_safe = poisson_safe_over_threshold(mu_total_arco, target=SAFE_OVER_TARGET)
+    arco_totales_under_line, prob_menos_arco_safe = poisson_safe_under_threshold(mu_total_arco, target=SAFE_UNDER_TARGET)
+    corners_totales_over_line, prob_corners_safe = poisson_safe_over_threshold(mu_total_corners, target=SAFE_OVER_TARGET)
+    corners_totales_under_line, prob_menos_corners_safe = poisson_safe_under_threshold(mu_total_corners, target=SAFE_UNDER_TARGET)
+    faltas_totales_over_line, prob_faltas_safe = poisson_safe_over_threshold(mu_total_faltas, target=SAFE_OVER_TARGET)
+    faltas_totales_under_line, prob_menos_faltas_safe = poisson_safe_under_threshold(mu_total_faltas, target=SAFE_UNDER_TARGET)
+    amarillas_totales_over_line, prob_amarillas_safe = poisson_safe_over_threshold(mu_total_amarillas, target=SAFE_OVER_TARGET)
+    amarillas_totales_under_line, prob_menos_amarillas_safe = poisson_safe_under_threshold(mu_total_amarillas, target=SAFE_UNDER_TARGET)
+
+    remates_local_over_line, prob_rem_l_safe = poisson_safe_over_threshold(rem_l, target=SAFE_OVER_TARGET)
+    remates_local_under_line, prob_menos_rem_l_safe = poisson_safe_under_threshold(rem_l, target=SAFE_UNDER_TARGET)
+    remates_visitante_over_line, prob_rem_v_safe = poisson_safe_over_threshold(rem_v, target=SAFE_OVER_TARGET)
+    remates_visitante_under_line, prob_menos_rem_v_safe = poisson_safe_under_threshold(rem_v, target=SAFE_UNDER_TARGET)
+    arco_local_over_line, prob_arco_l_safe = poisson_safe_over_threshold(arco_l, target=SAFE_OVER_TARGET)
+    arco_local_under_line, prob_menos_arco_l_safe = poisson_safe_under_threshold(arco_l, target=SAFE_UNDER_TARGET)
+    arco_visitante_over_line, prob_arco_v_safe = poisson_safe_over_threshold(arco_v, target=SAFE_OVER_TARGET)
+    arco_visitante_under_line, prob_menos_arco_v_safe = poisson_safe_under_threshold(arco_v, target=SAFE_UNDER_TARGET)
+    corners_local_over_line, prob_corn_l_safe = poisson_safe_over_threshold(corn_l, target=SAFE_OVER_TARGET)
+    corners_local_under_line, prob_menos_corn_l_safe = poisson_safe_under_threshold(corn_l, target=SAFE_UNDER_TARGET)
+    corners_visitante_over_line, prob_corn_v_safe = poisson_safe_over_threshold(corn_v, target=SAFE_OVER_TARGET)
+    corners_visitante_under_line, prob_menos_corn_v_safe = poisson_safe_under_threshold(corn_v, target=SAFE_UNDER_TARGET)
+    faltas_local_over_line, prob_faltas_l_safe = poisson_safe_over_threshold(faltas_l, target=SAFE_OVER_TARGET)
+    faltas_local_under_line, prob_menos_faltas_l_safe = poisson_safe_under_threshold(faltas_l, target=SAFE_UNDER_TARGET)
+    faltas_visitante_over_line, prob_faltas_v_safe = poisson_safe_over_threshold(faltas_v, target=SAFE_OVER_TARGET)
+    faltas_visitante_under_line, prob_menos_faltas_v_safe = poisson_safe_under_threshold(faltas_v, target=SAFE_UNDER_TARGET)
+    amarillas_local_over_line, prob_amarillas_l_safe = poisson_safe_over_threshold(amarillas_l, target=SAFE_OVER_TARGET)
+    amarillas_local_under_line, prob_menos_amarillas_l_safe = poisson_safe_under_threshold(amarillas_l, target=SAFE_UNDER_TARGET)
+    amarillas_visitante_over_line, prob_amarillas_v_safe = poisson_safe_over_threshold(amarillas_v, target=SAFE_OVER_TARGET)
+    amarillas_visitante_under_line, prob_menos_amarillas_v_safe = poisson_safe_under_threshold(amarillas_v, target=SAFE_UNDER_TARGET)
+
+    return {
+        "probabilidades": {
+            "local": round(float(prob_local) * 100, 2),
+            "empate": round(float(prob_empate) * 100, 2),
+            "visitante": round(float(prob_visitante) * 100, 2)
+        },
+        "probabilidades_pronosticos": {
+            "mas_de_1_5_goles": round(float(prob_mas_1_5) * 100, 2),
+            "mas_de_2_5_goles": round(float(prob_mas_2_5) * 100, 2),
+            "menos_de_3_5_goles": round(float(prob_menos_3_5) * 100, 2),
+            "menos_de_4_5_goles": round(float(prob_menos_4_5) * 100, 2),
+            "ambos_marcan": round(float(prob_ambos_marcan) * 100, 2),
+            "cumplir_estimacion_remates": round(float(prob_remates_over) * 100, 2),
+            "cumplir_estimacion_corners": round(float(prob_corners_over) * 100, 2),
+            "cumplir_estimacion_faltas": round(float(prob_faltas_over) * 100, 2),
+            "cumplir_estimacion_remates_al_arco": round(float(prob_arco_over) * 100, 2),
+            "cumplir_estimacion_tarjetas_amarillas": round(float(prob_amarillas_over) * 100, 2),
+            "menos_de_remates_totales": round(float(prob_menos_remates_totales) * 100, 2),
+            "menos_de_remates_local": round(float(prob_menos_remates_local) * 100, 2),
+            "menos_de_remates_visitante": round(float(prob_menos_remates_visitante) * 100, 2),
+            "menos_de_remates_al_arco_totales": round(float(prob_menos_arco_totales) * 100, 2),
+            "menos_de_remates_al_arco_local": round(float(prob_menos_arco_local) * 100, 2),
+            "menos_de_remates_al_arco_visitante": round(float(prob_menos_arco_visitante) * 100, 2),
+            "menos_de_corners_totales": round(float(prob_menos_corners_totales) * 100, 2),
+            "menos_de_corners_local": round(float(prob_menos_corners_local) * 100, 2),
+            "menos_de_corners_visitante": round(float(prob_menos_corners_visitante) * 100, 2),
+            "menos_de_faltas_totales": round(float(prob_menos_faltas_totales) * 100, 2),
+            "menos_de_faltas_local": round(float(prob_menos_faltas_local) * 100, 2),
+            "menos_de_faltas_visitante": round(float(prob_menos_faltas_visitante) * 100, 2)
+        },
+        "pronosticos_seguros": {
+            "remates_totales_exito_70plus": f"+ {remates_totales_over_line - 0.5}",
+            "prob_remates_seguro": round(float(prob_remates_safe) * 100, 2),
+            "menos_remates_totales_exito_70plus": f"- {remates_totales_under_line + 0.5}",
+            "menos_prob_remates_seguro": round(float(prob_menos_remates_safe) * 100, 2),
+            "remates_local_exito_70plus": f"+ {remates_local_over_line - 0.5}",
+            "prob_remates_local_seguro": round(float(prob_rem_l_safe) * 100, 2),
+            "menos_remates_local_exito_70plus": f"- {remates_local_under_line + 0.5}",
+            "menos_prob_remates_local_seguro": round(float(prob_menos_rem_l_safe) * 100, 2),
+            "remates_visitante_exito_70plus": f"+ {remates_visitante_over_line - 0.5}",
+            "prob_remates_visitante_seguro": round(float(prob_rem_v_safe) * 100, 2),
+            "menos_remates_visitante_exito_70plus": f"- {remates_visitante_under_line + 0.5}",
+            "menos_prob_remates_visitante_seguro": round(float(prob_menos_rem_v_safe) * 100, 2),
+            "corners_totales_exito_70plus": f"+ {corners_totales_over_line - 0.5}",
+            "prob_corners_seguro": round(float(prob_corners_safe) * 100, 2),
+            "menos_corners_totales_exito_70plus": f"- {corners_totales_under_line + 0.5}",
+            "menos_prob_corners_seguro": round(float(prob_menos_corners_safe) * 100, 2),
+            "corners_local_exito_70plus": f"+ {corners_local_over_line - 0.5}",
+            "prob_corners_local_seguro": round(float(prob_corn_l_safe) * 100, 2),
+            "menos_corners_local_exito_70plus": f"- {corners_local_under_line + 0.5}",
+            "menos_prob_corners_local_seguro": round(float(prob_menos_corn_l_safe) * 100, 2),
+            "corners_visitante_exito_70plus": f"+ {corners_visitante_over_line - 0.5}",
+            "prob_corners_visitante_seguro": round(float(prob_corn_v_safe) * 100, 2),
+            "menos_corners_visitante_exito_70plus": f"- {corners_visitante_under_line + 0.5}",
+            "menos_prob_corners_visitante_seguro": round(float(prob_menos_corn_v_safe) * 100, 2),
+            "remates_al_arco_exito_70plus": f"+ {arco_totales_over_line - 0.5}",
+            "prob_arco_seguro": round(float(prob_arco_safe) * 100, 2),
+            "menos_remates_al_arco_exito_70plus": f"- {arco_totales_under_line + 0.5}",
+            "menos_prob_arco_seguro": round(float(prob_menos_arco_safe) * 100, 2),
+            "remates_al_arco_local_exito_70plus": f"+ {arco_local_over_line - 0.5}",
+            "prob_arco_local_seguro": round(float(prob_arco_l_safe) * 100, 2),
+            "menos_remates_al_arco_local_exito_70plus": f"- {arco_local_under_line + 0.5}",
+            "menos_prob_arco_local_seguro": round(float(prob_menos_arco_l_safe) * 100, 2),
+            "remates_al_arco_visitante_exito_70plus": f"+ {arco_visitante_over_line - 0.5}",
+            "prob_arco_visitante_seguro": round(float(prob_arco_v_safe) * 100, 2),
+            "menos_remates_al_arco_visitante_exito_70plus": f"- {arco_visitante_under_line + 0.5}",
+            "menos_prob_arco_visitante_seguro": round(float(prob_menos_arco_v_safe) * 100, 2),
+            "faltas_totales_exito_70plus": f"+ {faltas_totales_over_line - 0.5}",
+            "prob_faltas_seguro": round(float(prob_faltas_safe) * 100, 2),
+            "menos_faltas_totales_exito_70plus": f"- {faltas_totales_under_line + 0.5}",
+            "menos_prob_faltas_seguro": round(float(prob_menos_faltas_safe) * 100, 2),
+            "faltas_local_exito_70plus": f"+ {faltas_local_over_line - 0.5}",
+            "prob_faltas_local_seguro": round(float(prob_faltas_l_safe) * 100, 2),
+            "menos_faltas_local_exito_70plus": f"- {faltas_local_under_line + 0.5}",
+            "menos_prob_faltas_local_seguro": round(float(prob_menos_faltas_l_safe) * 100, 2),
+            "faltas_visitante_exito_70plus": f"+ {faltas_visitante_over_line - 0.5}",
+            "prob_faltas_visitante_seguro": round(float(prob_faltas_v_safe) * 100, 2),
+            "menos_faltas_visitante_exito_70plus": f"- {faltas_visitante_under_line + 0.5}",
+            "menos_prob_faltas_visitante_seguro": round(float(prob_menos_faltas_v_safe) * 100, 2),
+            "amarillas_totales_exito_70plus": f"+ {amarillas_totales_over_line - 0.5}",
+            "prob_amarillas_seguro": round(float(prob_amarillas_safe) * 100, 2),
+            "menos_amarillas_totales_exito_70plus": f"- {amarillas_totales_under_line + 0.5}",
+            "menos_prob_amarillas_seguro": round(float(prob_menos_amarillas_safe) * 100, 2),
+            "amarillas_local_exito_70plus": f"+ {amarillas_local_over_line - 0.5}",
+            "prob_amarillas_local_seguro": round(float(prob_amarillas_l_safe) * 100, 2),
+            "menos_amarillas_local_exito_70plus": f"- {amarillas_local_under_line + 0.5}",
+            "menos_prob_amarillas_local_seguro": round(float(prob_menos_amarillas_l_safe) * 100, 2),
+            "amarillas_visitante_exito_70plus": f"+ {amarillas_visitante_over_line - 0.5}",
+            "prob_amarillas_visitante_seguro": round(float(prob_amarillas_v_safe) * 100, 2),
+            "menos_amarillas_visitante_exito_70plus": f"- {amarillas_visitante_under_line + 0.5}",
+            "menos_prob_amarillas_visitante_seguro": round(float(prob_menos_amarillas_v_safe) * 100, 2)
+        },
+        "marcador_probable": f"{res_idx[0]} - {res_idx[1]}",
+        "prediccion_remates_totales": round(float(mu_total_remates), 1),
+        "prediccion_remates_al_arco": round(float(arco_l + arco_v), 1),
+        "prediccion_faltas_totales": round(float(mu_total_faltas), 1),
+        "prediccion_tarjetas_amarillas_totales": round(float(mu_total_amarillas), 1),
+        "prediccion_corners_totales": round(float(mu_total_corners), 1),
+        "detalle_por_equipo": {
+            "local": {
+                "goles_esperados": round(mu_local, 2),
+                "probabilidad_anotar": round(float(prob_anotar_l) * 100, 2),
+                "probabilidad_ganar": round(float(prob_local) * 100, 2),
+                "remates": round(rem_l, 1),
+                "remates_al_arco": round(arco_l, 1),
+                "corners": round(corn_l, 1),
+                "faltas": round(faltas_l, 1),
+                "tarjetas_amarillas": round(amarillas_l, 1),
+                "tarjetas_rojas": round(rojas_l, 2),
+                "promedio_remates": round(avg_l["simple_remates"], 1),
+                "promedio_remates_al_arco": round(avg_l["simple_remates_arco"], 1),
+                "promedio_corners": round(avg_l["simple_corners"], 1),
+                "promedio_faltas": round(avg_l["simple_faltas"], 1),
+                "promedio_amarillas": round(avg_l["simple_amarillas"], 1),
+                "menos_de_remates": round(float(prob_menos_remates_local) * 100, 2),
+                "menos_de_remates_al_arco": round(float(prob_menos_arco_local) * 100, 2),
+                "menos_de_corners": round(float(prob_menos_corners_local) * 100, 2),
+                "menos_de_faltas": round(float(prob_menos_faltas_local) * 100, 2)
+            },
+            "visitante": {
+                "goles_esperados": round(mu_visitante, 2),
+                "probabilidad_anotar": round(float(prob_anotar_v) * 100, 2),
+                "probabilidad_ganar": round(float(prob_visitante) * 100, 2),
+                "remates": round(rem_v, 1),
+                "remates_al_arco": round(arco_v, 1),
+                "corners": round(corn_v, 1),
+                "faltas": round(faltas_v, 1),
+                "tarjetas_amarillas": round(amarillas_v, 1),
+                "tarjetas_rojas": round(rojas_v, 2),
+                "promedio_remates": round(avg_v["simple_remates"], 1),
+                "promedio_remates_al_arco": round(avg_v["simple_remates_arco"], 1),
+                "promedio_corners": round(avg_v["simple_corners"], 1),
+                "promedio_faltas": round(avg_v["simple_faltas"], 1),
+                "promedio_amarillas": round(avg_v["simple_amarillas"], 1),
+                "menos_de_remates": round(float(prob_menos_remates_visitante) * 100, 2),
+                "menos_de_remates_al_arco": round(float(prob_menos_arco_visitante) * 100, 2),
+                "menos_de_corners": round(float(prob_menos_corners_visitante) * 100, 2),
+                "menos_de_faltas": round(float(prob_menos_faltas_visitante) * 100, 2)
+            }
+        }
+    }
+@app.get("/health")
+def health():
+    return {"status": "alive"}
