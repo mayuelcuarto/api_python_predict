@@ -22,7 +22,7 @@ class _Poisson:
 
 poisson = _Poisson()
 
-app = FastAPI(title="Soccer Scraper API")
+app = FastAPI(title="API de prediccion de partidos")
 
 # Modelos de datos para la predicción
 class HistoricoPartido(BaseModel):
@@ -54,7 +54,7 @@ class DatosPrediccion(BaseModel):
 # Configuración de CORS para permitir peticiones desde Angular (habitualmente puerto 4200)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción, usa ["http://localhost:4200"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
