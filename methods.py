@@ -1,9 +1,18 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from math import exp, factorial
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
+from time import monotonic
+
+
+MAX_BODY_BYTES = 256 * 1024
+MAX_HISTORY_ITEMS = 30
+RATE_LIMIT_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+_rate_limit_state = {}
 
 
 class _Poisson:
@@ -27,38 +36,70 @@ app = FastAPI(title="API de prediccion de partidos")
 # Modelos de datos para la predicción
 class HistoricoPartido(BaseModel):
     fecha: Optional[datetime] = None
-    goles: float
-    goles_recibidos: float
-    remates: float
-    remates_recibidos: float
-    remates_al_arco: float
-    remates_al_arco_recibidos: float
-    corners: float
-    corners_recibidos: float
-    posesion: float
-    faltas: float
-    faltas_recibidas: float
-    tarjetas_amarillas: float
-    tarjetas_amarillas_contrarias: float
-    tarjetas_rojas: float
-    tarjetas_rojas_contrarias: float
+    goles: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    goles_recibidos: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    remates: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    remates_recibidos: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    remates_al_arco: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    remates_al_arco_recibidos: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    corners: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    corners_recibidos: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    posesion: float = Field(ge=-1, le=100, allow_inf_nan=False)
+    faltas: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    faltas_recibidas: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    tarjetas_amarillas: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    tarjetas_amarillas_contrarias: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    tarjetas_rojas: float = Field(ge=-1, le=1000, allow_inf_nan=False)
+    tarjetas_rojas_contrarias: float = Field(ge=-1, le=1000, allow_inf_nan=False)
     es_local: bool  # Indica si el equipo jugó en casa en ese partido histórico
     sede_neutral: bool
 
 class DatosPrediccion(BaseModel):
-    equipo_local: List[HistoricoPartido]
-    equipo_visitante: List[HistoricoPartido]
+    equipo_local: List[HistoricoPartido] = Field(max_length=MAX_HISTORY_ITEMS)
+    equipo_visitante: List[HistoricoPartido] = Field(max_length=MAX_HISTORY_ITEMS)
     es_neutral: bool = False
-    probabilidad: float = 0.75
+    probabilidad: float = Field(0.75, ge=0, le=1, allow_inf_nan=False)
 
 # Configuración de CORS para permitir peticiones desde Angular (habitualmente puerto 4200)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://alerta-donatelo.vercel.app"],
+    allow_credentials=False,
+    allow_methods=["POST", "GET"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+
+@app.middleware("http")
+async def protect_predict_endpoint(request: Request, call_next):
+    if request.url.path != "/api/predict" or request.method != "POST":
+        return await call_next(request)
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+        if declared_length < 0 or declared_length > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = monotonic()
+    request_times = [
+        timestamp for timestamp in _rate_limit_state.get(client_ip, [])
+        if now - timestamp < RATE_LIMIT_WINDOW_SECONDS
+    ]
+    if len(request_times) >= RATE_LIMIT_REQUESTS:
+        return JSONResponse(status_code=429, content={"detail": "Too many requests"})
+    request_times.append(now)
+    _rate_limit_state[client_ip] = request_times
+
+    return await call_next(request)
 
 
 @app.post("/api/predict")
